@@ -102,35 +102,42 @@ function lookupEst(prov, depto, muestra) {
 }
 
 // ══════════════════════════════════════════
-// PARSE SM RESPONSE → case object
+// PARSE SM RESPONSE → raw answers by questionId
+// Estrato lookup and age grouping happens in the dashboard (HTML)
+// because the reference table lives there
 // ══════════════════════════════════════════
-function parseResponse(response, colMap, muestra) {
-  /*
-    colMap: {
-      gen: questionId,
-      edad: questionId,
-      prov: questionId,
-      depto: { [provinciaKey]: questionId },  // one col per province
-      filterCol: questionId,
-      filterVal: 'not answered',
-      idCol: questionId (optional)
-    }
-  */
+function parseResponse(response, colMap) {
   const pages = response.pages || [];
   const answers = {};
+
+  // Build a map of questionId → choice texts (for multiple choice questions)
+  const choiceTexts = {}; // questionId → { choiceId → text }
+
+  pages.forEach(page => {
+    (page.questions || []).forEach(q => {
+      const qid = q.id;
+      // Store choice texts for lookup
+      if (q.answers && q.answers.choices) {
+        choiceTexts[qid] = {};
+        q.answers.choices.forEach(c => { choiceTexts[qid][c.id] = c.text; });
+      }
+    });
+  });
 
   pages.forEach(page => {
     (page.questions || []).forEach(q => {
       const qid = q.id;
       const rows = q.answers || [];
       if (!rows.length) return;
-      // For single-choice / open-text, just grab the first answer text
       const first = rows[0];
-      answers[qid] = first.text || first.simple_text || first.choice_id || '';
-
-      // Also store by choice text if available
-      if (first.text) answers[qid] = first.text;
-      else if (first.simple_text) answers[qid] = first.simple_text;
+      // Priority: text > simple_text > resolve choice_id via choiceTexts > choice_id raw
+      let val = '';
+      if (first.text) val = first.text;
+      else if (first.simple_text) val = first.simple_text;
+      else if (first.choice_id && choiceTexts[qid] && choiceTexts[qid][first.choice_id]) {
+        val = choiceTexts[qid][first.choice_id];
+      } else if (first.choice_id) val = first.choice_id;
+      answers[qid] = val.trim();
     });
   });
 
@@ -147,26 +154,28 @@ function parseResponse(response, colMap, muestra) {
 
   if (!gen || isNaN(edadRaw)) return null;
 
-  // Find depto: look in per-province mapping
+  // Find depto from per-province question mapping
   let depto = '';
   if (colMap.depto) {
-    const provKey = normProv(prov);
-    // Try exact match first, then alias
     for (const [pk, qid] of Object.entries(colMap.depto)) {
-      if (normProv(pk) === provKey) {
+      if (normProv(pk) === normProv(prov)) {
         depto = (answers[qid] || '').trim();
         if (depto) break;
       }
     }
+    // Fallback: try all mapped columns
+    if (!depto) {
+      for (const [pk, qid] of Object.entries(colMap.depto)) {
+        const v = (answers[qid] || '').trim();
+        if (v) { depto = v; break; }
+      }
+    }
   }
 
-  const estrato = lookupEst(prov, depto, muestra) || '?';
-  const ageBounds = muestra ? parseAgeBounds(muestra.ageGroups) : [];
-  const ageGrp = muestra ? getAgeGrp(edadRaw, ageBounds, muestra.ageGroups) : '?';
-  const key = `${gen}||${ageGrp}||${estrato}`;
   const id = colMap.idCol ? (answers[colMap.idCol] || response.id) : response.id;
 
-  return { id, gen, edad: edadRaw, ageGrp, prov, depto, estrato, key, ts: Date.now() };
+  // Return raw — dashboard will assign estrato, ageGrp, key
+  return { id, gen, edad: edadRaw, prov, depto, ts: Date.now() };
 }
 
 // ══════════════════════════════════════════
@@ -181,7 +190,7 @@ async function fetchAllResponses(surveyId) {
     const res = await smGet(`/surveys/${surveyId}/responses/bulk`, {
       per_page: perPage,
       page,
-      status: 'completed',
+      // status: 'completed', // fetch all responses
     });
     const data = res.data.data || [];
     allResponses.push(...data);
@@ -194,49 +203,38 @@ async function fetchAllResponses(surveyId) {
 }
 
 // ══════════════════════════════════════════
-// SYNC: fetch SM → process → write Firebase
+// SYNC: fetch SM → send raw cases to Firebase
+// Estrato + ageGrp assigned by dashboard (HTML)
 // ══════════════════════════════════════════
 async function syncSurvey(surveyId, colMap, muestra, appState) {
   console.log(`→ Sincronizando encuesta ${surveyId}...`);
 
+  // Fetch both completed and partial responses
   const responses = await fetchAllResponses(surveyId);
-  console.log(`  ${responses.length} respuestas completadas`);
+  console.log(`  ${responses.length} respuestas obtenidas`);
 
-  const cases = [];
-  let excluded = 0, noEst = 0;
+  const rawCases = [];
+  let excluded = 0;
 
   responses.forEach(r => {
-    const c = parseResponse(r, colMap, muestra);
+    const c = parseResponse(r, colMap);
     if (!c) { excluded++; return; }
-    cases.push(c);
-    if (c.estrato === '?') noEst++;
+    rawCases.push(c);
   });
 
-  console.log(`  ✓ ${cases.length} válidos · ${excluded} excluidos · ${noEst} sin estrato`);
+  console.log(`  ✓ ${rawCases.length} válidos · ${excluded} excluidos/filtrados`);
 
-  // Compute quotas from muestra + N
-  const n = appState.n || 2500;
-  const quotas = {};
-  if (muestra && muestra.distribution) {
-    Object.entries(muestra.distribution).forEach(([k, pct]) => {
-      quotas[k] = Math.round(pct / 100 * n);
-    });
-  }
-
-  // Merge into APP state
+  // Write raw cases to Firebase — dashboard handles estrato + quota logic
   const newState = {
     ...appState,
-    cases,
-    quotas,
-    nextId: cases.length + 1,
+    rawCases,           // new field: raw cases without estrato
     lastSync: new Date().toISOString(),
-    syncStats: { total: responses.length, valid: cases.length, excluded, noEst },
+    syncStats: { total: responses.length, valid: rawCases.length, excluded },
   };
 
-  // Write to Firebase
   if (db) {
     await db.ref('pulso/v4').set(JSON.stringify(newState));
-    console.log(`  ✓ Firebase actualizado`);
+    console.log(`  ✓ Firebase actualizado con ${rawCases.length} casos raw`);
   }
 
   return newState;
