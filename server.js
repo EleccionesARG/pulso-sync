@@ -1,3 +1,4 @@
+
 const express = require('express');
 const axios = require('axios');
 const admin = require('firebase-admin');
@@ -246,7 +247,7 @@ async function syncSurvey(surveyId, colMap, muestra, appState) {
   };
 
   if (db) {
-    await db.ref('pulso/v4').set(JSON.stringify(newState));
+    await db.ref('pulso/v4sync').set(JSON.stringify(newState));
     console.log(`  ✓ Firebase actualizado con ${rawCases.length} casos raw`);
   }
 
