@@ -1,3 +1,4 @@
+
 const express = require('express');
 const axios = require('axios');
 const admin = require('firebase-admin');
@@ -367,8 +368,8 @@ app.get('/sync/status', (req, res) => {
   });
 });
 
-// DELETE /sync/stop
-app.delete('/sync/stop', (req, res) => {
+// POST /sync/stop
+app.post('/sync/stop', (req, res) => {
   if (cronJob) { cronJob.stop(); cronJob = null; }
   syncConfig = null;
   res.json({ ok: true, message: 'Sync detenido' });
