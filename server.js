@@ -1,4 +1,3 @@
-
 const express = require('express');
 const axios = require('axios');
 const admin = require('firebase-admin');
@@ -106,37 +105,28 @@ function lookupEst(prov, depto, muestra) {
 // Estrato lookup and age grouping happens in the dashboard (HTML)
 // because the reference table lives there
 // ══════════════════════════════════════════
-function parseResponse(response, colMap) {
+function parseResponse(response, colMap, choiceMap) {
   const pages = response.pages || [];
   const answers = {};
 
-  // Build a map of questionId → choice texts (for multiple choice questions)
-  const choiceTexts = {}; // questionId → { choiceId → text }
-
   pages.forEach(page => {
     (page.questions || []).forEach(q => {
       const qid = q.id;
-      // Store choice texts for lookup
-      if (q.answers && q.answers.choices) {
-        choiceTexts[qid] = {};
-        q.answers.choices.forEach(c => { choiceTexts[qid][c.id] = c.text; });
-      }
-    });
-  });
+      const qAnswers = q.answers || [];
+      if (!qAnswers.length) return;
+      const first = qAnswers[0];
 
-  pages.forEach(page => {
-    (page.questions || []).forEach(q => {
-      const qid = q.id;
-      const rows = q.answers || [];
-      if (!rows.length) return;
-      const first = rows[0];
-      // Priority: text > simple_text > resolve choice_id via choiceTexts > choice_id raw
       let val = '';
-      if (first.text) val = first.text;
+      // 1. Use choiceMap (pre-loaded from survey details) to resolve choice_id
+      if (first.choice_id && choiceMap && choiceMap[qid] && choiceMap[qid][first.choice_id]) {
+        val = choiceMap[qid][first.choice_id];
+      }
+      // 2. Fallback: direct text fields
+      else if (first.text) val = first.text;
       else if (first.simple_text) val = first.simple_text;
-      else if (first.choice_id && choiceTexts[qid] && choiceTexts[qid][first.choice_id]) {
-        val = choiceTexts[qid][first.choice_id];
-      } else if (first.choice_id) val = first.choice_id;
+      // 3. Last resort: raw choice_id (will show as number — shouldn't happen with choiceMap)
+      else if (first.choice_id) val = String(first.choice_id);
+
       answers[qid] = val.trim();
     });
   });
@@ -179,6 +169,28 @@ function parseResponse(response, colMap) {
 }
 
 // ══════════════════════════════════════════
+// FETCH CHOICE MAP (questionId → choiceId → text)
+// ══════════════════════════════════════════
+async function fetchChoiceMap(surveyId) {
+  const res = await smGet(`/surveys/${surveyId}/details`);
+  const choiceMap = {}; // questionId → { choiceId → text }
+  (res.data.pages || []).forEach(page => {
+    (page.questions || []).forEach(q => {
+      const qid = q.id;
+      choiceMap[qid] = {};
+      // choices can be in answers.choices or rows or cols
+      const choices = (q.answers && q.answers.choices) || q.choices || [];
+      choices.forEach(c => { choiceMap[qid][c.id] = c.text; });
+      // also map rows (for matrix questions)
+      const rows = (q.answers && q.answers.rows) || q.rows || [];
+      rows.forEach(r => { choiceMap[qid][r.id] = r.text; });
+    });
+  });
+  console.log(`  ✓ Mapa de opciones cargado: ${Object.keys(choiceMap).length} preguntas`);
+  return choiceMap;
+}
+
+// ══════════════════════════════════════════
 // FETCH ALL RESPONSES (paginated)
 // ══════════════════════════════════════════
 async function fetchAllResponses(surveyId) {
@@ -190,14 +202,12 @@ async function fetchAllResponses(surveyId) {
     const res = await smGet(`/surveys/${surveyId}/responses/bulk`, {
       per_page: perPage,
       page,
-      // status: 'completed', // fetch all responses
     });
     const data = res.data.data || [];
     allResponses.push(...data);
     if (data.length < perPage) break;
     page++;
-    // Respect rate limits
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 300));
   }
   return allResponses;
 }
@@ -210,6 +220,9 @@ async function syncSurvey(surveyId, colMap, muestra, appState) {
   console.log(`→ Sincronizando encuesta ${surveyId}...`);
 
   // Fetch both completed and partial responses
+  // Load choice map first so we can resolve option texts
+  const choiceMap = await fetchChoiceMap(surveyId);
+
   const responses = await fetchAllResponses(surveyId);
   console.log(`  ${responses.length} respuestas obtenidas`);
 
@@ -217,7 +230,7 @@ async function syncSurvey(surveyId, colMap, muestra, appState) {
   let excluded = 0;
 
   responses.forEach(r => {
-    const c = parseResponse(r, colMap);
+    const c = parseResponse(r, colMap, choiceMap);
     if (!c) { excluded++; return; }
     rawCases.push(c);
   });
