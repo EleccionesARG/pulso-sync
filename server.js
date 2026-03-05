@@ -145,22 +145,28 @@ function parseResponse(response, colMap, choiceMap) {
 
   if (!gen || isNaN(edadRaw)) return null;
 
-  // Find depto from per-province question mapping
+  // Find depto: match per-province question using respondent's province
   let depto = '';
-  if (colMap.depto) {
+  if (colMap.depto && prov) {
+    const provNorm = normProv(prov);
+    // Exact normProv match
     for (const [pk, qid] of Object.entries(colMap.depto)) {
-      if (normProv(pk) === normProv(prov)) {
-        depto = (answers[qid] || '').trim();
-        if (depto) break;
+      if (normProv(pk) === provNorm) {
+        const v = (answers[qid] || '').trim();
+        if (v && v !== '-' && v !== '–') { depto = v; break; }
       }
     }
-    // Fallback: try all mapped columns
+    // Partial match fallback
     if (!depto) {
       for (const [pk, qid] of Object.entries(colMap.depto)) {
-        const v = (answers[qid] || '').trim();
-        if (v) { depto = v; break; }
+        const pkn = normProv(pk);
+        if (provNorm.includes(pkn) || pkn.includes(provNorm)) {
+          const v = (answers[qid] || '').trim();
+          if (v && v !== '-' && v !== '–') { depto = v; break; }
+        }
       }
     }
+    // No global fallback — wrong province depto is worse than empty
   }
 
   const id = colMap.idCol ? (answers[colMap.idCol] || response.id) : response.id;
@@ -236,7 +242,11 @@ async function syncSurvey(surveyId, colMap, muestra, appState) {
     rawCases.push(c);
   });
 
-  console.log(`  ✓ ${rawCases.length} válidos · ${excluded} excluidos/filtrados`);
+  const withDepto = rawCases.filter(c => c.depto).length;
+  const noDepto = rawCases.length - withDepto;
+  console.log(`  ✓ ${rawCases.length} válidos · ${excluded} excluidos · ${withDepto} con depto · ${noDepto} sin depto`);
+  // Debug: show first 3 cases
+  rawCases.slice(0,3).forEach((c,i) => console.log(`    [${i+1}] gen=${c.gen} edad=${c.edad} prov="${c.prov}" depto="${c.depto}"`));
 
   // Write raw cases to Firebase — dashboard handles estrato + quota logic
   const newState = {
