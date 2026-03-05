@@ -245,8 +245,17 @@ async function syncSurvey(surveyId, colMap, muestra, appState) {
   const withDepto = rawCases.filter(c => c.depto).length;
   const noDepto = rawCases.length - withDepto;
   console.log(`  ✓ ${rawCases.length} válidos · ${excluded} excluidos · ${withDepto} con depto · ${noDepto} sin depto`);
-  // Debug: show first 3 cases
-  rawCases.slice(0,3).forEach((c,i) => console.log(`    [${i+1}] gen=${c.gen} edad=${c.edad} prov="${c.prov}" depto="${c.depto}"`));
+  // Debug: show first 5 cases
+  rawCases.slice(0,5).forEach((c,i) => console.log(`    [${i+1}] gen=${c.gen} edad=${c.edad} prov="${c.prov}" depto="${c.depto||'(vacío)'}"`));
+  // Debug: show colMap.depto keys
+  if(colMap.depto && Object.keys(colMap.depto).length > 0){
+    console.log(`  colMap.depto keys: ${Object.keys(colMap.depto).join(', ')}`);
+  } else {
+    console.log('  ⚠ colMap.depto está vacío o no configurado');
+  }
+  // Debug: show distinct provs in responses
+  const distinctProvs = [...new Set(rawCases.map(c=>c.prov).filter(Boolean))].slice(0,8);
+  console.log(`  Provincias en respuestas: ${distinctProvs.join(', ')}`);
 
   // Write raw cases to Firebase — dashboard handles estrato + quota logic
   const newState = {
