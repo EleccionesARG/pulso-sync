@@ -79,26 +79,54 @@ function parseAgeBounds(groups) {
   });
 }
 
-// Lookup estrato from muestra refTable
+// Lookup estrato from muestra refTable — smart, tries all combinations
 function lookupEst(prov, depto, muestra) {
-  if (!muestra) return null;
-  const pn = normProv(prov);
+  if (!muestra || !muestra.refTable || !muestra.refTable.length) return null;
 
-  // Fixed overrides
-  if (muestra.fixedEstrato && muestra.fixedEstrato[pn] !== undefined) {
-    return muestra.fixedEstrato[pn];
+  const pn = normProv(prov  || '');
+  const dn = norm    (depto || '');
+
+  // 1. Fixed overrides
+  if (muestra.fixedEstrato) {
+    if (pn && muestra.fixedEstrato[pn] !== undefined) return String(muestra.fixedEstrato[pn]);
+    if (dn && muestra.fixedEstrato[dn] !== undefined) return String(muestra.fixedEstrato[dn]);
   }
 
-  const dn = norm(depto);
-  let r;
-  if (muestra.cobertura === 'provincial' || muestra.cobertura === 'municipal') {
-    r = muestra.refTable.find(x => norm(x.nivel2) === dn);
-    if (!r) r = muestra.refTable.find(x => norm(x.nivel2).includes(dn) || dn.includes(norm(x.nivel2)));
-  } else {
-    r = muestra.refTable.find(x => normProv(x.nivel1) === pn && norm(x.nivel2) === dn);
-    if (!r) r = muestra.refTable.find(x => normProv(x.nivel1) === pn && (norm(x.nivel2).includes(dn) || dn.includes(norm(x.nivel2))));
+  const rt = muestra.refTable;
+  const eq  = (a, b) => a === b;
+  const inc = (a, b) => a.includes(b) || b.includes(a);
+  let r = null;
+
+  // Estrategia 1: nivel1 + nivel2 exacto
+  if (pn && dn) {
+    r = rt.find(x => eq(normProv(x.nivel1), pn) && eq(norm(x.nivel2), dn));
+    if (!r) r = rt.find(x => eq(normProv(x.nivel1), pn) && inc(norm(x.nivel2), dn));
   }
-  return r ? r.estrato : null;
+  if (r) return String(r.estrato);
+
+  // Estrategia 2: prov en nivel2 (departamento llegó como prov)
+  if (pn) {
+    r = rt.find(x => eq(norm(x.nivel2), pn));
+    if (!r) r = rt.find(x => inc(norm(x.nivel2), pn));
+  }
+  if (r) return String(r.estrato);
+
+  // Estrategia 3: depto en nivel2
+  if (dn) {
+    r = rt.find(x => eq(norm(x.nivel2), dn));
+    if (!r) r = rt.find(x => inc(norm(x.nivel2), dn));
+  }
+  if (r) return String(r.estrato);
+
+  // Estrategia 4: prov en nivel1 sin nivel2 (tabla de 1 sola columna)
+  if (pn) {
+    r = rt.find(x => eq(normProv(x.nivel1), pn) && (!x.nivel2 || x.nivel2 === ''));
+    if (!r && rt.every(x => !x.nivel2 || x.nivel2 === ''))
+      r = rt.find(x => eq(normProv(x.nivel1), pn));
+  }
+  if (r) return String(r.estrato);
+
+  return null;
 }
 
 // ══════════════════════════════════════════
