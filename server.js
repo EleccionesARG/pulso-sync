@@ -257,32 +257,36 @@ async function syncSurvey(surveyId, colMap, muestra, appState) {
   const distinctProvs = [...new Set(rawCases.map(c=>c.prov).filter(Boolean))].slice(0,8);
   console.log(`  Provincias en respuestas: ${distinctProvs.join(', ')}`);
 
-  // Write raw cases to Firebase — dashboard handles estrato + quota logic
+  // Write raw cases to Firebase at a per-survey path
+  // surveyId is included so the dashboard can route data to the correct survey
   const newState = {
-    ...appState,
-    rawCases,           // new field: raw cases without estrato
+    surveyId,           // ★ critical: dashboard uses this to identify which survey to update
+    rawCases,
     lastSync: new Date().toISOString(),
     syncStats: { total: responses.length, valid: rawCases.length, excluded },
   };
 
   if (db) {
-    await db.ref('pulso/v4sync').set(JSON.stringify(newState));
-    console.log(`  ✓ Firebase actualizado con ${rawCases.length} casos raw`);
+    // Each survey writes to its own path: pulso/v4sync/{surveyId}
+    await db.ref(`pulso/v4sync/${surveyId}`).set(JSON.stringify(newState));
+    console.log(`  ✓ Firebase [pulso/v4sync/${surveyId}] actualizado con ${rawCases.length} casos raw`);
   }
 
   return newState;
 }
 
 // ══════════════════════════════════════════
-// SYNC STATE (in-memory, also persisted to Firebase)
+// SYNC STATE — one config per surveyId
 // ══════════════════════════════════════════
-let syncConfig = null; // { surveyId, colMap, muestraId, intervalMinutes }
-let cronJob = null;
+// syncConfigs: { [surveyId]: { surveyId, colMap, muestraId, intervalMinutes } }
+// cronJobs:    { [surveyId]: CronJob }
+const syncConfigs = {};
+const cronJobs    = {};
 
 async function getAppState() {
   if (!db) return {};
   try {
-    const snap = await db.ref('pulso/v4').once('value');
+    const snap = await db.ref('pulso/v4config').once('value');
     const val = snap.val();
     return val ? JSON.parse(val) : {};
   } catch (e) {
@@ -290,24 +294,34 @@ async function getAppState() {
   }
 }
 
-async function runSync() {
-  if (!syncConfig) return;
+async function runSyncForSurvey(surveyId) {
+  const cfg = syncConfigs[surveyId];
+  if (!cfg) return;
   try {
     const appState = await getAppState();
-    const muestra = (appState.muestras || []).find(m => m.id === syncConfig.muestraId) || null;
-    await syncSurvey(syncConfig.surveyId, syncConfig.colMap, muestra, appState);
+    const muestra = (appState.muestras || []).find(m => m.id === cfg.muestraId) || null;
+    await syncSurvey(surveyId, cfg.colMap, muestra, appState);
   } catch (e) {
-    console.error('Error en sync:', e.message);
+    console.error(`Error en sync [${surveyId}]:`, e.message);
   }
 }
 
-function startCron(minutes) {
-  if (cronJob) { cronJob.stop(); cronJob = null; }
+function startCronForSurvey(surveyId, minutes) {
+  // Stop existing cron for this survey if any
+  if (cronJobs[surveyId]) { cronJobs[surveyId].stop(); delete cronJobs[surveyId]; }
   if (!minutes || minutes < 1) return;
-  // Cron every N minutes
   const expr = `*/${Math.max(1, minutes)} * * * *`;
-  cronJob = cron.schedule(expr, runSync);
-  console.log(`✓ Cron activo: cada ${minutes} minutos`);
+  cronJobs[surveyId] = cron.schedule(expr, () => runSyncForSurvey(surveyId));
+  console.log(`✓ Cron activo [${surveyId}]: cada ${minutes} minutos`);
+}
+
+// Legacy runSync — runs all configured surveys (used by /sync/now without body)
+async function runSync() {
+  const ids = Object.keys(syncConfigs);
+  if (!ids.length) return;
+  for (const id of ids) {
+    await runSyncForSurvey(id);
+  }
 }
 
 // ══════════════════════════════════════════
@@ -316,14 +330,19 @@ function startCron(minutes) {
 
 // Health check
 app.get('/', (req, res) => {
+  const activeSurveys = Object.keys(syncConfigs).map(id => ({
+    surveyId: id,
+    muestraId: syncConfigs[id].muestraId,
+    intervalMinutes: syncConfigs[id].intervalMinutes,
+    cronActive: !!cronJobs[id],
+  }));
   res.json({
     status: 'ok',
-    service: 'Pulso Sync Server',
+    service: 'Pulso Sync Server v2 (multi-survey)',
     firebase: !!db,
     sm_token: !!SM_TOKEN,
-    syncActive: !!cronJob,
-    syncConfig: syncConfig ? { surveyId: syncConfig.surveyId, muestraId: syncConfig.muestraId, intervalMinutes: syncConfig.intervalMinutes } : null,
-    lastSync: syncConfig?.lastSync || null,
+    activeSurveys,
+    totalActive: activeSurveys.length,
   });
 });
 
@@ -366,26 +385,38 @@ app.get('/surveys/:id/questions', async (req, res) => {
   }
 });
 
-// POST /sync/config — set which survey + muestra to sync
+// POST /sync/config — register a survey for periodic sync (one config per surveyId)
 app.post('/sync/config', async (req, res) => {
   const { surveyId, colMap, muestraId, intervalMinutes } = req.body;
   if (!surveyId || !colMap) return res.status(400).json({ error: 'surveyId y colMap requeridos' });
 
-  syncConfig = { surveyId, colMap, muestraId, intervalMinutes: intervalMinutes || 15 };
-  startCron(syncConfig.intervalMinutes);
+  const minutes = intervalMinutes || 15;
+  syncConfigs[surveyId] = { surveyId, colMap, muestraId, intervalMinutes: minutes };
+  startCronForSurvey(surveyId, minutes);
 
-  // Run immediately
-  runSync().catch(console.error);
+  console.log(`✓ Configurado sync para encuesta ${surveyId} (${Object.keys(syncConfigs).length} total activas)`);
 
-  res.json({ ok: true, message: `Sync configurado: encuesta ${surveyId} cada ${syncConfig.intervalMinutes} min` });
+  // Run immediately for this survey
+  runSyncForSurvey(surveyId).catch(console.error);
+
+  res.json({ ok: true, message: `Sync configurado: encuesta ${surveyId} cada ${minutes} min` });
 });
 
-// POST /sync/now — manual trigger
+// POST /sync/now — manual trigger (all surveys, or specific one via body.surveyId)
 app.post('/sync/now', async (req, res) => {
-  if (!syncConfig) return res.status(400).json({ error: 'No hay sync configurado. Usá /sync/config primero.' });
+  const { surveyId } = req.body || {};
+  if (!Object.keys(syncConfigs).length) {
+    return res.status(400).json({ error: 'No hay sync configurado. Usá /sync/config primero.' });
+  }
   try {
-    await runSync();
-    res.json({ ok: true, message: 'Sync ejecutado' });
+    if (surveyId && syncConfigs[surveyId]) {
+      await runSyncForSurvey(surveyId);
+      res.json({ ok: true, message: `Sync ejecutado para encuesta ${surveyId}` });
+    } else {
+      // Sync all surveys
+      await runSync();
+      res.json({ ok: true, message: `Sync ejecutado para ${Object.keys(syncConfigs).length} encuesta(s)` });
+    }
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -394,16 +425,62 @@ app.post('/sync/now', async (req, res) => {
 // GET /sync/status
 app.get('/sync/status', (req, res) => {
   res.json({
-    active: !!cronJob,
-    config: syncConfig,
+    active: Object.keys(cronJobs).length > 0,
+    surveys: Object.keys(syncConfigs).map(id => ({
+      surveyId: id,
+      intervalMinutes: syncConfigs[id].intervalMinutes,
+      cronActive: !!cronJobs[id],
+    })),
   });
 });
 
-// POST /sync/stop
+// POST /sync/stop — detiene una encuesta específica (body.surveyId) o todas
 app.post('/sync/stop', (req, res) => {
-  if (cronJob) { cronJob.stop(); cronJob = null; }
-  syncConfig = null;
-  res.json({ ok: true, message: 'Sync detenido' });
+  const { surveyId } = req.body || {};
+  if (surveyId) {
+    if (cronJobs[surveyId]) { cronJobs[surveyId].stop(); delete cronJobs[surveyId]; }
+    delete syncConfigs[surveyId];
+    res.json({ ok: true, message: `Sync detenido para encuesta ${surveyId}` });
+  } else {
+    // Stop all
+    Object.values(cronJobs).forEach(j => j.stop());
+    Object.keys(cronJobs).forEach(k => delete cronJobs[k]);
+    Object.keys(syncConfigs).forEach(k => delete syncConfigs[k]);
+    res.json({ ok: true, message: 'Todos los syncs detenidos' });
+  }
+});
+
+// ══════════════════════════════════════════
+// META ADS
+// ══════════════════════════════════════════
+const META_TOKEN   = process.env.META_TOKEN;
+const META_ACCOUNT = process.env.META_ACCOUNT_ID; // e.g. act_1234567890
+
+app.get('/meta/adsets', async (req, res) => {
+  if (!META_TOKEN || !META_ACCOUNT) {
+    return res.json({ ok: false, error: 'META_TOKEN o META_ACCOUNT_ID no configurados en Railway' });
+  }
+  try {
+    const url = `https://graph.facebook.com/v19.0/${META_ACCOUNT}/adsets` +
+      `?fields=id,name,status,effective_status,daily_budget,lifetime_budget,campaign_id` +
+      `&limit=100&access_token=${META_TOKEN}`;
+    const r = await axios.get(url);
+    const adsets = (r.data.data || []).map(a => ({
+      id:              a.id,
+      name:            a.name,
+      status:          a.status,
+      effectiveStatus: a.effective_status,
+      dailyBudget:     a.daily_budget,
+      lifetimeBudget:  a.lifetime_budget,
+      campaignId:      a.campaign_id,
+    }));
+    console.log(`Meta: ${adsets.length} conjuntos obtenidos`);
+    res.json({ ok: true, adsets, fetchedAt: Date.now() });
+  } catch (e) {
+    const errMsg = e.response?.data?.error?.message || e.message;
+    console.error('Meta API error:', errMsg);
+    res.json({ ok: false, error: errMsg });
+  }
 });
 
 // ══════════════════════════════════════════
@@ -414,4 +491,5 @@ app.listen(PORT, () => {
   console.log(`Pulso Sync Server corriendo en puerto ${PORT}`);
   console.log(`SM Token: ${SM_TOKEN ? '✓ configurado' : '✗ falta SURVEYMONKEY_TOKEN'}`);
   console.log(`Firebase: ${db ? '✓ conectado' : '✗ falta FIREBASE_SERVICE_ACCOUNT'}`);
+  console.log(`Meta Ads: ${META_TOKEN ? '✓ configurado' : '✗ falta META_TOKEN'}`);
 });
