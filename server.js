@@ -1,4 +1,3 @@
-
 const express = require('express');
 const axios = require('axios');
 const admin = require('firebase-admin');
@@ -79,14 +78,13 @@ function parseAgeBounds(groups) {
   });
 }
 
-// Lookup estrato from muestra refTable — smart, tries all combinations
+// Lookup estrato from muestra refTable — smart, handles nacional/provincial/subnacional
 function lookupEst(prov, depto, muestra) {
   if (!muestra || !muestra.refTable || !muestra.refTable.length) return null;
 
   const pn = normProv(prov  || '');
   const dn = norm    (depto || '');
 
-  // 1. Fixed overrides
   if (muestra.fixedEstrato) {
     if (pn && muestra.fixedEstrato[pn] !== undefined) return String(muestra.fixedEstrato[pn]);
     if (dn && muestra.fixedEstrato[dn] !== undefined) return String(muestra.fixedEstrato[dn]);
@@ -94,35 +92,38 @@ function lookupEst(prov, depto, muestra) {
 
   const rt = muestra.refTable;
   const eq  = (a, b) => a === b;
-  const inc = (a, b) => a.includes(b) || b.includes(a);
+  const inc = (a, b) => a.length > 0 && b.length > 0 && (a.includes(b) || b.includes(a));
+  const hasNivel1 = rt.some(x => x.nivel1 && x.nivel1.trim() !== '');
   let r = null;
 
-  // Estrategia 1: nivel1 + nivel2 exacto
-  if (pn && dn) {
+  // Estrategia 1: nivel1+nivel2 (tabla nacional)
+  if (hasNivel1 && pn && dn) {
     r = rt.find(x => eq(normProv(x.nivel1), pn) && eq(norm(x.nivel2), dn));
     if (!r) r = rt.find(x => eq(normProv(x.nivel1), pn) && inc(norm(x.nivel2), dn));
+    if (!r) r = rt.find(x => inc(normProv(x.nivel1), pn) && inc(norm(x.nivel2), dn));
   }
   if (r) return String(r.estrato);
 
-  // Estrategia 2: prov en nivel2 (departamento llegó como prov)
-  if (pn) {
+  // Estrategia 2: solo nivel2 (tabla subnacional o prov sin depto)
+  if (!hasNivel1) {
+    const val = dn || pn;
+    if (val) {
+      r = rt.find(x => eq(norm(x.nivel2), val));
+      if (!r) r = rt.find(x => inc(norm(x.nivel2), val));
+    }
+  } else if (hasNivel1 && !dn && pn) {
+    // Tabla nacional pero depto vacío: prov podría ser el depto (caso Perú)
     r = rt.find(x => eq(norm(x.nivel2), pn));
     if (!r) r = rt.find(x => inc(norm(x.nivel2), pn));
+    if (!r) r = rt.find(x => eq(normProv(x.nivel1), pn));
+    if (!r) r = rt.find(x => inc(normProv(x.nivel1), pn));
   }
   if (r) return String(r.estrato);
 
-  // Estrategia 3: depto en nivel2
-  if (dn) {
-    r = rt.find(x => eq(norm(x.nivel2), dn));
-    if (!r) r = rt.find(x => inc(norm(x.nivel2), dn));
-  }
-  if (r) return String(r.estrato);
-
-  // Estrategia 4: prov en nivel1 sin nivel2 (tabla de 1 sola columna)
-  if (pn) {
-    r = rt.find(x => eq(normProv(x.nivel1), pn) && (!x.nivel2 || x.nivel2 === ''));
-    if (!r && rt.every(x => !x.nivel2 || x.nivel2 === ''))
-      r = rt.find(x => eq(normProv(x.nivel1), pn));
+  // Estrategia 3: tabla nivel1 sin nivel2
+  if (hasNivel1 && pn && rt.every(x => !x.nivel2 || x.nivel2 === '')) {
+    r = rt.find(x => eq(normProv(x.nivel1), pn));
+    if (!r) r = rt.find(x => inc(normProv(x.nivel1), pn));
   }
   if (r) return String(r.estrato);
 
