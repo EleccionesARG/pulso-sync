@@ -1,13 +1,13 @@
 const express = require('express');
-const axios = require('axios');
-const admin = require('firebase-admin');
-const cron = require('node-cron');
+const axios   = require('axios');
+const admin   = require('firebase-admin');
+const cron    = require('node-cron');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // ══════════════════════════════════════════
-// CORS — permite llamadas desde GitHub Pages
+// CORS
 // ══════════════════════════════════════════
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -37,12 +37,19 @@ try {
 // SURVEYMONKEY CLIENT
 // ══════════════════════════════════════════
 const SM_TOKEN = process.env.SURVEYMONKEY_TOKEN;
-const SM_BASE = 'https://api.surveymonkey.com/v3';
+const SM_BASE  = 'https://api.surveymonkey.com/v3';
 
 function smGet(path, params = {}) {
   return axios.get(`${SM_BASE}${path}`, {
     headers: { Authorization: `Bearer ${SM_TOKEN}` },
     params,
+    timeout: 30000,
+  });
+}
+function smPost(path, data = {}) {
+  return axios.post(`${SM_BASE}${path}`, data, {
+    headers: { Authorization: `Bearer ${SM_TOKEN}`, 'Content-Type': 'application/json' },
+    timeout: 60000,
   });
 }
 
@@ -52,7 +59,6 @@ function smGet(path, params = {}) {
 function norm(s) {
   return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
 }
-
 const PROV_ALIASES = {
   'ciudad autonoma de buenos aires': 'caba', 'ciudad de buenos aires': 'caba',
   'capital federal': 'caba', 'buenos aires ciudad': 'caba', 'c.a.b.a.': 'caba',
@@ -71,40 +77,25 @@ function getAgeGrp(edad, bounds, groups) {
   return '?';
 }
 
-function parseAgeBounds(groups) {
-  return groups.map(g => {
-    if (g.endsWith('+')) return [parseInt(g), 999];
-    const p = g.split('-'); return [parseInt(p[0]), parseInt(p[1])];
-  });
-}
-
-// Lookup estrato from muestra refTable — smart, handles nacional/provincial/subnacional
 function lookupEst(prov, depto, muestra) {
   if (!muestra || !muestra.refTable || !muestra.refTable.length) return null;
-
   const pn = normProv(prov  || '');
   const dn = norm    (depto || '');
-
   if (muestra.fixedEstrato) {
     if (pn && muestra.fixedEstrato[pn] !== undefined) return String(muestra.fixedEstrato[pn]);
     if (dn && muestra.fixedEstrato[dn] !== undefined) return String(muestra.fixedEstrato[dn]);
   }
-
   const rt = muestra.refTable;
   const eq  = (a, b) => a === b;
   const inc = (a, b) => a.length > 0 && b.length > 0 && (a.includes(b) || b.includes(a));
   const hasNivel1 = rt.some(x => x.nivel1 && x.nivel1.trim() !== '');
   let r = null;
-
-  // Estrategia 1: nivel1+nivel2 (tabla nacional)
   if (hasNivel1 && pn && dn) {
     r = rt.find(x => eq(normProv(x.nivel1), pn) && eq(norm(x.nivel2), dn));
     if (!r) r = rt.find(x => eq(normProv(x.nivel1), pn) && inc(norm(x.nivel2), dn));
     if (!r) r = rt.find(x => inc(normProv(x.nivel1), pn) && inc(norm(x.nivel2), dn));
   }
   if (r) return String(r.estrato);
-
-  // Estrategia 2: solo nivel2 (tabla subnacional o prov sin depto)
   if (!hasNivel1) {
     const val = dn || pn;
     if (val) {
@@ -112,80 +103,316 @@ function lookupEst(prov, depto, muestra) {
       if (!r) r = rt.find(x => inc(norm(x.nivel2), val));
     }
   } else if (hasNivel1 && !dn && pn) {
-    // Tabla nacional pero depto vacío: prov podría ser el depto (caso Perú)
     r = rt.find(x => eq(norm(x.nivel2), pn));
     if (!r) r = rt.find(x => inc(norm(x.nivel2), pn));
     if (!r) r = rt.find(x => eq(normProv(x.nivel1), pn));
     if (!r) r = rt.find(x => inc(normProv(x.nivel1), pn));
   }
   if (r) return String(r.estrato);
-
-  // Estrategia 3: tabla nivel1 sin nivel2
   if (hasNivel1 && pn && rt.every(x => !x.nivel2 || x.nivel2 === '')) {
     r = rt.find(x => eq(normProv(x.nivel1), pn));
     if (!r) r = rt.find(x => inc(normProv(x.nivel1), pn));
   }
   if (r) return String(r.estrato);
-
   return null;
 }
 
-// ══════════════════════════════════════════
-// PARSE SM RESPONSE → raw answers by questionId
-// Estrato lookup and age grouping happens in the dashboard (HTML)
-// because the reference table lives there
-// ══════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
+// CSV EXPORT MODULE
+// Usa la API de bulk export de SM — UNA sola request por sync.
+// Mucho más eficiente que paginar /responses/bulk individualmente.
+//
+// Flujo:
+//   1. POST /surveys/{id}/exports → crea un job de export
+//   2. GET  /surveys/{id}/exports/{jobId} → polling hasta status=completed
+//   3. GET  {url} → descarga el CSV
+//   4. Parsear el CSV con los headers de SM
+// ══════════════════════════════════════════════════════════════
+
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function requestCsvExport(surveyId) {
+  // body vacío = exportar todas las respuestas en formato CSV estándar
+  const res = await smPost(`/surveys/${surveyId}/exports`, {
+    format: 'csv',
+    language: 'es',      // encabezados en español si están disponibles
+    all_answered: false, // incluir parciales
+  });
+  return res.data.id;   // jobId
+}
+
+async function pollExportJob(surveyId, jobId, maxWaitMs = 120000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    await sleep(3000);
+    const res = await smGet(`/surveys/${surveyId}/exports/${jobId}`);
+    const { status, url } = res.data;
+    console.log(`  Export job ${jobId}: ${status}`);
+    if (status === 'completed' && url) return url;
+    if (status === 'failed') throw new Error('Export job falló en SurveyMonkey');
+  }
+  throw new Error('Timeout esperando export CSV (>2 min)');
+}
+
+async function downloadCsv(url) {
+  const res = await axios.get(url, {
+    responseType: 'text',
+    timeout: 60000,
+    headers: { 'Accept-Encoding': 'identity' }, // evitar gzip que complica el stream
+  });
+  return res.data; // string CSV crudo
+}
+
+function parseCsv(raw) {
+  // Parser robusto: maneja comillas, saltos de línea dentro de celdas, BOM
+  const text = raw.replace(/^\uFEFF/, ''); // BOM
+  const rows = [];
+  let cur = [], cell = '', inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i], n = text[i+1];
+    if (inQ) {
+      if (c === '"' && n === '"') { cell += '"'; i++; }        // "" → "
+      else if (c === '"')          inQ = false;
+      else                         cell += c;
+    } else {
+      if      (c === '"')  { inQ = true; }
+      else if (c === ',')  { cur.push(cell); cell = ''; }
+      else if (c === '\n') { cur.push(cell); rows.push(cur); cur = []; cell = ''; }
+      else if (c === '\r') { /* ignorar CR */ }
+      else                 cell += c;
+    }
+  }
+  if (cell || cur.length) { cur.push(cell); rows.push(cur); }
+  return rows.filter(r => r.some(c => c.trim() !== ''));
+}
+
+// Detectar automáticamente qué columnas del CSV corresponden a gen/edad/prov
+// usando el colMap del dashboard (que tiene question headings o IDs)
+function detectCsvColumns(headers, colMap, questionsMeta) {
+  // questionsMeta: [{ id, heading }] — del endpoint /questions
+  // colMap: { gen: questionId, edad: questionId, prov: questionId, depto: { prov: questionId } }
+  //
+  // El CSV de SM tiene como encabezado el texto de la pregunta, no el ID.
+  // Necesitamos: questionId → heading → columna en el CSV
+
+  const idToHeading = {};
+  (questionsMeta || []).forEach(q => { idToHeading[q.id] = q.heading; });
+
+  const headNorm = headers.map(h => norm(h));
+
+  function findCol(questionId) {
+    if (!questionId) return -1;
+    // Buscar por heading exacto
+    const heading = idToHeading[questionId];
+    if (heading) {
+      const idx = headers.findIndex(h => norm(h) === norm(heading));
+      if (idx >= 0) return idx;
+      // Búsqueda parcial
+      const idx2 = headers.findIndex(h => norm(h).includes(norm(heading)) || norm(heading).includes(norm(h)));
+      if (idx2 >= 0) return idx2;
+    }
+    // Fallback: buscar por keywords si no hay metadata
+    return -1;
+  }
+
+  // Para depto: { provincia: columna_idx }
+  const deptoColMap = {};
+  if (colMap.depto) {
+    for (const [prov, qId] of Object.entries(colMap.depto)) {
+      const col = findCol(qId);
+      if (col >= 0) deptoColMap[prov] = col;
+    }
+  }
+
+  return {
+    gen:       findCol(colMap.gen),
+    edad:      findCol(colMap.edad),
+    prov:      findCol(colMap.prov),
+    idCol:     findCol(colMap.idCol),
+    filterCol: findCol(colMap.filterCol),
+    depto:     deptoColMap,
+  };
+}
+
+// Convertir filas CSV → rawCases (mismo formato que el sync por API)
+function csvRowsToRawCases(rows, colIdx, colMap) {
+  if (rows.length < 2) return [];
+  const filterExclude = (colMap.filterVal || 'not answered').trim().toLowerCase();
+  const rawCases = [];
+
+  rows.slice(1).forEach((row, i) => {  // slice(1) = saltar header
+    if (colIdx.filterCol >= 0) {
+      const val = (row[colIdx.filterCol] || '').trim().toLowerCase();
+      if (val === filterExclude || val === '') return;
+    }
+    const gen     = (row[colIdx.gen]  || '').trim();
+    const edadRaw = parseInt(row[colIdx.edad] || '');
+    const prov    = (row[colIdx.prov] || '').trim();
+    if (!gen || isNaN(edadRaw)) return;
+
+    let depto = '';
+    if (colIdx.depto && prov) {
+      const provNorm = normProv(prov);
+      for (const [pk, ci] of Object.entries(colIdx.depto)) {
+        if (normProv(pk) === provNorm) {
+          const v = (row[ci] || '').trim();
+          if (v && v !== '-' && v !== '–') { depto = v; break; }
+        }
+      }
+      if (!depto) {
+        for (const [pk, ci] of Object.entries(colIdx.depto)) {
+          const pkn = normProv(pk);
+          if (provNorm.includes(pkn) || pkn.includes(provNorm)) {
+            const v = (row[ci] || '').trim();
+            if (v && v !== '-' && v !== '–') { depto = v; break; }
+          }
+        }
+      }
+    }
+
+    // ID: columna dedicada, o número de fila
+    const id = colIdx.idCol >= 0 && row[colIdx.idCol]
+      ? row[colIdx.idCol].trim()
+      : `R${String(i+1).padStart(4,'0')}`;
+
+    rawCases.push({ id, gen, edad: edadRaw, prov, depto, ts: Date.now() });
+  });
+
+  return rawCases;
+}
+
+// ══════════════════════════════════════════════════════════════
+// FETCH QUESTION METADATA (para mapear columnas CSV)
+// ══════════════════════════════════════════════════════════════
+async function fetchQuestionsMeta(surveyId) {
+  const res = await smGet(`/surveys/${surveyId}/details`);
+  const questions = [];
+  (res.data.pages || []).forEach(page => {
+    (page.questions || []).forEach(q => {
+      questions.push({
+        id: q.id,
+        heading: q.headings?.[0]?.heading || q.id,
+        type: q.family,
+        choices: (q.answers?.choices || []).map(c => c.text),
+      });
+    });
+  });
+  return questions;
+}
+
+// ══════════════════════════════════════════════════════════════
+// syncSurveyCSV: flujo completo usando CSV export
+// Solo 3 requests a SM en total (1 export + polling + download)
+// ══════════════════════════════════════════════════════════════
+async function syncSurveyCSV(surveyId, colMap, muestra) {
+  console.log(`→ [CSV] Sincronizando encuesta ${surveyId}...`);
+
+  // 1. Obtener metadata de preguntas (1 request — igual que antes)
+  const questionsMeta = await fetchQuestionsMeta(surveyId);
+  console.log(`  ${questionsMeta.length} preguntas en metadata`);
+
+  // 2. Crear job de export CSV (1 request)
+  const jobId = await requestCsvExport(surveyId);
+  console.log(`  Export job creado: ${jobId}`);
+
+  // 3. Esperar y descargar (1 request de polling + 1 download)
+  const csvUrl = await pollExportJob(surveyId, jobId);
+  const csvRaw = await downloadCsv(csvUrl);
+  console.log(`  CSV descargado (${Math.round(csvRaw.length/1024)}KB)`);
+
+  // 4. Parsear
+  const rows = parseCsv(csvRaw);
+  console.log(`  ${rows.length - 1} filas en CSV (sin header)`);
+  if (rows.length < 2) {
+    console.warn('  ⚠ CSV vacío o sin respuestas');
+    return { surveyId, rawCases: [], lastSync: new Date().toISOString(), syncStats: { total: 0, valid: 0 } };
+  }
+
+  // 5. Detectar columnas
+  const headers = rows[0];
+  const colIdx  = detectCsvColumns(headers, colMap, questionsMeta);
+  console.log(`  Columnas detectadas: gen=${colIdx.gen} edad=${colIdx.edad} prov=${colIdx.prov} depto_keys=${Object.keys(colIdx.depto).length}`);
+
+  if (colIdx.gen < 0 || colIdx.edad < 0 || colIdx.prov < 0) {
+    console.warn('  ⚠ No se pudieron detectar las columnas principales. Headers del CSV:');
+    console.warn('  ', headers.slice(0, 15).join(' | '));
+    // Devolver igual para que el dashboard lo vea
+  }
+
+  // 6. Convertir a rawCases
+  const rawCases = csvRowsToRawCases(rows, colIdx, colMap);
+  console.log(`  ✓ ${rawCases.length} casos válidos`);
+
+  const newState = {
+    surveyId,
+    rawCases,
+    lastSync: new Date().toISOString(),
+    syncStats: { total: rows.length - 1, valid: rawCases.length },
+    source: 'csv_export',
+  };
+
+  if (db) {
+    await db.ref(`pulso/v4sync/${surveyId}`).set(JSON.stringify(newState));
+    console.log(`  ✓ Firebase actualizado [pulso/v4sync/${surveyId}]`);
+  }
+
+  return newState;
+}
+
+// ══════════════════════════════════════════════════════════════
+// syncSurveyAPI: flujo original por API (fallback / compatibilidad)
+// ══════════════════════════════════════════════════════════════
+async function fetchChoiceMap(surveyId) {
+  const res = await smGet(`/surveys/${surveyId}/details`);
+  const choiceMap = {};
+  (res.data.pages || []).forEach(page => {
+    (page.questions || []).forEach(q => {
+      const qid = q.id;
+      choiceMap[qid] = {};
+      const choices = (q.answers && q.answers.choices) || q.choices || [];
+      choices.forEach(c => { choiceMap[qid][c.id] = c.text; });
+      const rows = (q.answers && q.answers.rows) || q.rows || [];
+      rows.forEach(r => { choiceMap[qid][r.id] = r.text; });
+    });
+  });
+  return choiceMap;
+}
+
 function parseResponse(response, colMap, choiceMap) {
   const pages = response.pages || [];
   const answers = {};
-
   pages.forEach(page => {
     (page.questions || []).forEach(q => {
       const qid = q.id;
       const qAnswers = q.answers || [];
       if (!qAnswers.length) return;
       const first = qAnswers[0];
-
       let val = '';
-      // 1. Use choiceMap (pre-loaded from survey details) to resolve choice_id
-      if (first.choice_id && choiceMap && choiceMap[qid] && choiceMap[qid][first.choice_id]) {
-        val = choiceMap[qid][first.choice_id];
-      }
-      // 2. Fallback: direct text fields
-      else if (first.text) val = first.text;
+      if (first.choice_id && choiceMap?.[qid]?.[first.choice_id]) val = choiceMap[qid][first.choice_id];
+      else if (first.text)        val = first.text;
       else if (first.simple_text) val = first.simple_text;
-      // 3. Last resort: raw choice_id (will show as number — shouldn't happen with choiceMap)
-      else if (first.choice_id) val = String(first.choice_id);
-
+      else if (first.choice_id)   val = String(first.choice_id);
       answers[qid] = val.trim();
     });
   });
-
-  // Eligibility filter
   if (colMap.filterCol && colMap.filterVal) {
     const resp = (answers[colMap.filterCol] || '').trim().toLowerCase();
     const exclude = colMap.filterVal.trim().toLowerCase();
     if (resp === exclude || resp === '') return null;
   }
-
   const gen = (answers[colMap.gen] || '').trim();
   const edadRaw = parseInt(answers[colMap.edad]);
   const prov = (answers[colMap.prov] || '').trim();
-
   if (!gen || isNaN(edadRaw)) return null;
-
-  // Find depto: match per-province question using respondent's province
   let depto = '';
   if (colMap.depto && prov) {
     const provNorm = normProv(prov);
-    // Exact normProv match
     for (const [pk, qid] of Object.entries(colMap.depto)) {
       if (normProv(pk) === provNorm) {
         const v = (answers[qid] || '').trim();
         if (v && v !== '-' && v !== '–') { depto = v; break; }
       }
     }
-    // Partial match fallback
     if (!depto) {
       for (const [pk, qid] of Object.entries(colMap.depto)) {
         const pkn = normProv(pk);
@@ -195,120 +422,94 @@ function parseResponse(response, colMap, choiceMap) {
         }
       }
     }
-    // No global fallback — wrong province depto is worse than empty
   }
-
   const id = colMap.idCol ? (answers[colMap.idCol] || response.id) : response.id;
-
-  // Return raw — dashboard will assign estrato, ageGrp, key
   return { id, gen, edad: edadRaw, prov, depto, ts: Date.now() };
 }
 
-// ══════════════════════════════════════════
-// FETCH CHOICE MAP (questionId → choiceId → text)
-// ══════════════════════════════════════════
-async function fetchChoiceMap(surveyId) {
-  const res = await smGet(`/surveys/${surveyId}/details`);
-  const choiceMap = {}; // questionId → { choiceId → text }
-  (res.data.pages || []).forEach(page => {
-    (page.questions || []).forEach(q => {
-      const qid = q.id;
-      choiceMap[qid] = {};
-      // choices can be in answers.choices or rows or cols
-      const choices = (q.answers && q.answers.choices) || q.choices || [];
-      choices.forEach(c => { choiceMap[qid][c.id] = c.text; });
-      // also map rows (for matrix questions)
-      const rows = (q.answers && q.answers.rows) || q.rows || [];
-      rows.forEach(r => { choiceMap[qid][r.id] = r.text; });
-    });
-  });
-  console.log(`  ✓ Mapa de opciones cargado: ${Object.keys(choiceMap).length} preguntas`);
-  return choiceMap;
-}
-
-// ══════════════════════════════════════════
-// FETCH ALL RESPONSES (paginated)
-// ══════════════════════════════════════════
-async function fetchAllResponses(surveyId) {
-  const allResponses = [];
-  let page = 1;
-  const perPage = 100;
-
+async function syncSurveyAPI(surveyId, colMap, muestra, appState) {
+  console.log(`→ [API] Sincronizando encuesta ${surveyId}...`);
+  const choiceMap = await fetchChoiceMap(surveyId);
+  let allResponses = [], page = 1;
   while (true) {
-    const res = await smGet(`/surveys/${surveyId}/responses/bulk`, {
-      per_page: perPage,
-      page,
-    });
+    const res = await smGet(`/surveys/${surveyId}/responses/bulk`, { per_page: 100, page });
     const data = res.data.data || [];
     allResponses.push(...data);
-    if (data.length < perPage) break;
+    if (data.length < 100) break;
     page++;
-    await new Promise(r => setTimeout(r, 300));
+    await sleep(300);
   }
-  return allResponses;
-}
-
-// ══════════════════════════════════════════
-// SYNC: fetch SM → send raw cases to Firebase
-// Estrato + ageGrp assigned by dashboard (HTML)
-// ══════════════════════════════════════════
-async function syncSurvey(surveyId, colMap, muestra, appState) {
-  console.log(`→ Sincronizando encuesta ${surveyId}...`);
-
-  // Fetch both completed and partial responses
-  // Load choice map first so we can resolve option texts
-  const choiceMap = await fetchChoiceMap(surveyId);
-
-  const responses = await fetchAllResponses(surveyId);
-  console.log(`  ${responses.length} respuestas obtenidas`);
-
+  console.log(`  ${allResponses.length} respuestas obtenidas`);
   const rawCases = [];
-  let excluded = 0;
-
-  responses.forEach(r => {
+  allResponses.forEach(r => {
     const c = parseResponse(r, colMap, choiceMap);
-    if (!c) { excluded++; return; }
-    rawCases.push(c);
+    if (c) rawCases.push(c);
   });
-
-  const withDepto = rawCases.filter(c => c.depto).length;
-  const noDepto = rawCases.length - withDepto;
-  console.log(`  ✓ ${rawCases.length} válidos · ${excluded} excluidos · ${withDepto} con depto · ${noDepto} sin depto`);
-  // Debug: show first 5 cases
-  rawCases.slice(0,5).forEach((c,i) => console.log(`    [${i+1}] gen=${c.gen} edad=${c.edad} prov="${c.prov}" depto="${c.depto||'(vacío)'}"`));
-  // Debug: show colMap.depto keys
-  if(colMap.depto && Object.keys(colMap.depto).length > 0){
-    console.log(`  colMap.depto keys: ${Object.keys(colMap.depto).join(', ')}`);
-  } else {
-    console.log('  ⚠ colMap.depto está vacío o no configurado');
-  }
-  // Debug: show distinct provs in responses
-  const distinctProvs = [...new Set(rawCases.map(c=>c.prov).filter(Boolean))].slice(0,8);
-  console.log(`  Provincias en respuestas: ${distinctProvs.join(', ')}`);
-
-  // Write raw cases to Firebase at a per-survey path
-  // surveyId is included so the dashboard can route data to the correct survey
-  const newState = {
-    surveyId,           // ★ critical: dashboard uses this to identify which survey to update
-    rawCases,
-    lastSync: new Date().toISOString(),
-    syncStats: { total: responses.length, valid: rawCases.length, excluded },
-  };
-
+  console.log(`  ✓ ${rawCases.length} válidos`);
+  const newState = { surveyId, rawCases, lastSync: new Date().toISOString(), source: 'api' };
   if (db) {
-    // Each survey writes to its own path: pulso/v4sync/{surveyId}
     await db.ref(`pulso/v4sync/${surveyId}`).set(JSON.stringify(newState));
-    console.log(`  ✓ Firebase [pulso/v4sync/${surveyId}] actualizado con ${rawCases.length} casos raw`);
   }
-
   return newState;
 }
 
+// ══════════════════════════════════════════════════════════════
+// SYNC DISPATCHER: elige CSV o API según config
+// ══════════════════════════════════════════════════════════════
+async function syncSurvey(surveyId, colMap, muestra, appState) {
+  const cfg = syncConfigs[surveyId] || {};
+  const useCSV = cfg.useCSV !== false; // default: CSV
+
+  if (useCSV) {
+    return syncSurveyCSV(surveyId, colMap, muestra);
+  } else {
+    return syncSurveyAPI(surveyId, colMap, muestra, appState);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════
+// SCHEDULED CSV UPLOAD: el dashboard puede enviar un CSV manual
+// al servidor para procesarlo y subirlo a Firebase
+// ══════════════════════════════════════════════════════════════
+app.post('/csv/upload', async (req, res) => {
+  const { surveyId, csvContent, colMap } = req.body;
+  if (!surveyId || !csvContent) {
+    return res.status(400).json({ error: 'surveyId y csvContent requeridos' });
+  }
+
+  try {
+    const rows = parseCsv(csvContent);
+    if (rows.length < 2) return res.status(400).json({ error: 'CSV vacío' });
+
+    const headers = rows[0];
+    // Para upload manual, el colMap viene con nombres de columna (índices o textos)
+    // Intentar detectar por headers
+    const cfg = syncConfigs[surveyId];
+    const questionsMeta = cfg ? [] : []; // sin metadata para upload manual
+    const colIdx = detectCsvColumns(headers, colMap || {}, questionsMeta);
+    const rawCases = csvRowsToRawCases(rows, colIdx, colMap || {});
+
+    const newState = {
+      surveyId, rawCases,
+      lastSync: new Date().toISOString(),
+      syncStats: { total: rows.length - 1, valid: rawCases.length },
+      source: 'manual_upload',
+    };
+
+    if (db) {
+      await db.ref(`pulso/v4sync/${surveyId}`).set(JSON.stringify(newState));
+    }
+
+    console.log(`[CSV upload] ${surveyId}: ${rawCases.length} casos procesados`);
+    res.json({ ok: true, total: rows.length - 1, valid: rawCases.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ══════════════════════════════════════════
-// SYNC STATE — one config per surveyId
+// SYNC STATE
 // ══════════════════════════════════════════
-// syncConfigs: { [surveyId]: { surveyId, colMap, muestraId, intervalMinutes } }
-// cronJobs:    { [surveyId]: CronJob }
 const syncConfigs = {};
 const cronJobs    = {};
 
@@ -318,9 +519,7 @@ async function getAppState() {
     const snap = await db.ref('pulso/v4config').once('value');
     const val = snap.val();
     return val ? JSON.parse(val) : {};
-  } catch (e) {
-    return {};
-  }
+  } catch (e) { return {}; }
 }
 
 async function runSyncForSurvey(surveyId) {
@@ -328,7 +527,7 @@ async function runSyncForSurvey(surveyId) {
   if (!cfg) return;
   try {
     const appState = await getAppState();
-    const muestra = (appState.muestras || []).find(m => m.id === cfg.muestraId) || null;
+    const muestra  = (appState.muestras || []).find(m => m.id === cfg.muestraId) || null;
     await syncSurvey(surveyId, cfg.colMap, muestra, appState);
   } catch (e) {
     console.error(`Error en sync [${surveyId}]:`, e.message);
@@ -336,19 +535,15 @@ async function runSyncForSurvey(surveyId) {
 }
 
 function startCronForSurvey(surveyId, minutes) {
-  // Stop existing cron for this survey if any
   if (cronJobs[surveyId]) { cronJobs[surveyId].stop(); delete cronJobs[surveyId]; }
   if (!minutes || minutes < 1) return;
   const expr = `*/${Math.max(1, minutes)} * * * *`;
   cronJobs[surveyId] = cron.schedule(expr, () => runSyncForSurvey(surveyId));
-  console.log(`✓ Cron activo [${surveyId}]: cada ${minutes} minutos`);
+  console.log(`✓ Cron activo [${surveyId}]: cada ${minutes} min (modo CSV)`);
 }
 
-// Legacy runSync — runs all configured surveys (used by /sync/now without body)
 async function runSync() {
-  const ids = Object.keys(syncConfigs);
-  if (!ids.length) return;
-  for (const id of ids) {
+  for (const id of Object.keys(syncConfigs)) {
     await runSyncForSurvey(id);
   }
 }
@@ -357,17 +552,17 @@ async function runSync() {
 // ROUTES
 // ══════════════════════════════════════════
 
-// Health check
 app.get('/', (req, res) => {
   const activeSurveys = Object.keys(syncConfigs).map(id => ({
     surveyId: id,
     muestraId: syncConfigs[id].muestraId,
     intervalMinutes: syncConfigs[id].intervalMinutes,
+    mode: syncConfigs[id].useCSV === false ? 'API' : 'CSV',
     cronActive: !!cronJobs[id],
   }));
   res.json({
     status: 'ok',
-    service: 'Pulso Sync Server v2 (multi-survey)',
+    service: 'Pulso Sync Server v3 (CSV mode)',
     firebase: !!db,
     sm_token: !!SM_TOKEN,
     activeSurveys,
@@ -375,63 +570,44 @@ app.get('/', (req, res) => {
   });
 });
 
-// GET /surveys — list all surveys from SM account
 app.get('/surveys', async (req, res) => {
   if (!SM_TOKEN) return res.status(500).json({ error: 'SURVEYMONKEY_TOKEN no configurado' });
   try {
     const r = await smGet('/surveys', { per_page: 50 });
-    const surveys = (r.data.data || []).map(s => ({
-      id: s.id,
-      title: s.title,
-      response_count: s.response_count,
-      date_modified: s.date_modified,
-    }));
-    res.json({ surveys });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    res.json({ surveys: (r.data.data || []).map(s => ({
+      id: s.id, title: s.title,
+      response_count: s.response_count, date_modified: s.date_modified,
+    }))});
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /surveys/:id/questions — get question list for column mapping
 app.get('/surveys/:id/questions', async (req, res) => {
   if (!SM_TOKEN) return res.status(500).json({ error: 'SURVEYMONKEY_TOKEN no configurado' });
   try {
-    const r = await smGet(`/surveys/${req.params.id}/details`);
-    const questions = [];
-    (r.data.pages || []).forEach(page => {
-      (page.questions || []).forEach(q => {
-        questions.push({
-          id: q.id,
-          heading: q.headings?.[0]?.heading || q.id,
-          type: q.family,
-          choices: (q.answers?.choices || []).map(c => c.text),
-        });
-      });
-    });
+    const questions = await fetchQuestionsMeta(req.params.id);
     res.json({ questions });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /sync/config — register a survey for periodic sync (one config per surveyId)
+// POST /sync/config — registrar encuesta con modo CSV por defecto
 app.post('/sync/config', async (req, res) => {
-  const { surveyId, colMap, muestraId, intervalMinutes } = req.body;
+  const { surveyId, colMap, muestraId, intervalMinutes, useCSV } = req.body;
   if (!surveyId || !colMap) return res.status(400).json({ error: 'surveyId y colMap requeridos' });
 
-  const minutes = intervalMinutes || 15;
-  syncConfigs[surveyId] = { surveyId, colMap, muestraId, intervalMinutes: minutes };
+  const minutes = intervalMinutes || 720; // default: cada 12h si no se especifica
+  syncConfigs[surveyId] = {
+    surveyId, colMap, muestraId,
+    intervalMinutes: minutes,
+    useCSV: useCSV !== false, // default CSV
+  };
   startCronForSurvey(surveyId, minutes);
 
-  console.log(`✓ Configurado sync para encuesta ${surveyId} (${Object.keys(syncConfigs).length} total activas)`);
-
-  // Run immediately for this survey
+  // Sync inmediato
   runSyncForSurvey(surveyId).catch(console.error);
 
-  res.json({ ok: true, message: `Sync configurado: encuesta ${surveyId} cada ${minutes} min` });
+  res.json({ ok: true, message: `Sync configurado: ${surveyId} cada ${minutes} min (modo ${syncConfigs[surveyId].useCSV?'CSV':'API'})` });
 });
 
-// POST /sync/now — manual trigger (all surveys, or specific one via body.surveyId)
 app.post('/sync/now', async (req, res) => {
   const { surveyId } = req.body || {};
   if (!Object.keys(syncConfigs).length) {
@@ -442,36 +618,31 @@ app.post('/sync/now', async (req, res) => {
       await runSyncForSurvey(surveyId);
       res.json({ ok: true, message: `Sync ejecutado para encuesta ${surveyId}` });
     } else {
-      // Sync all surveys
       await runSync();
       res.json({ ok: true, message: `Sync ejecutado para ${Object.keys(syncConfigs).length} encuesta(s)` });
     }
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// GET /sync/status
 app.get('/sync/status', (req, res) => {
   res.json({
     active: Object.keys(cronJobs).length > 0,
     surveys: Object.keys(syncConfigs).map(id => ({
       surveyId: id,
       intervalMinutes: syncConfigs[id].intervalMinutes,
+      mode: syncConfigs[id].useCSV === false ? 'API' : 'CSV',
       cronActive: !!cronJobs[id],
     })),
   });
 });
 
-// POST /sync/stop — detiene una encuesta específica (body.surveyId) o todas
 app.post('/sync/stop', (req, res) => {
   const { surveyId } = req.body || {};
   if (surveyId) {
     if (cronJobs[surveyId]) { cronJobs[surveyId].stop(); delete cronJobs[surveyId]; }
     delete syncConfigs[surveyId];
-    res.json({ ok: true, message: `Sync detenido para encuesta ${surveyId}` });
+    res.json({ ok: true, message: `Sync detenido: ${surveyId}` });
   } else {
-    // Stop all
     Object.values(cronJobs).forEach(j => j.stop());
     Object.keys(cronJobs).forEach(k => delete cronJobs[k]);
     Object.keys(syncConfigs).forEach(k => delete syncConfigs[k]);
@@ -479,36 +650,25 @@ app.post('/sync/stop', (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════
-// META ADS
-// ══════════════════════════════════════════
+// Meta Ads (sin cambios)
 const META_TOKEN   = process.env.META_TOKEN;
-const META_ACCOUNT = process.env.META_ACCOUNT_ID; // e.g. act_1234567890
+const META_ACCOUNT = process.env.META_ACCOUNT_ID;
 
 app.get('/meta/adsets', async (req, res) => {
   if (!META_TOKEN || !META_ACCOUNT) {
-    return res.json({ ok: false, error: 'META_TOKEN o META_ACCOUNT_ID no configurados en Railway' });
+    return res.json({ ok: false, error: 'META_TOKEN o META_ACCOUNT_ID no configurados' });
   }
   try {
     const url = `https://graph.facebook.com/v19.0/${META_ACCOUNT}/adsets` +
       `?fields=id,name,status,effective_status,daily_budget,lifetime_budget,campaign_id` +
       `&limit=100&access_token=${META_TOKEN}`;
     const r = await axios.get(url);
-    const adsets = (r.data.data || []).map(a => ({
-      id:              a.id,
-      name:            a.name,
-      status:          a.status,
-      effectiveStatus: a.effective_status,
-      dailyBudget:     a.daily_budget,
-      lifetimeBudget:  a.lifetime_budget,
-      campaignId:      a.campaign_id,
-    }));
-    console.log(`Meta: ${adsets.length} conjuntos obtenidos`);
-    res.json({ ok: true, adsets, fetchedAt: Date.now() });
+    res.json({ ok: true, adsets: (r.data.data || []).map(a => ({
+      id: a.id, name: a.name, status: a.status, effectiveStatus: a.effective_status,
+      dailyBudget: a.daily_budget, lifetimeBudget: a.lifetime_budget, campaignId: a.campaign_id,
+    })), fetchedAt: Date.now() });
   } catch (e) {
-    const errMsg = e.response?.data?.error?.message || e.message;
-    console.error('Meta API error:', errMsg);
-    res.json({ ok: false, error: errMsg });
+    res.json({ ok: false, error: e.response?.data?.error?.message || e.message });
   }
 });
 
@@ -517,8 +677,9 @@ app.get('/meta/adsets', async (req, res) => {
 // ══════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Pulso Sync Server corriendo en puerto ${PORT}`);
-  console.log(`SM Token: ${SM_TOKEN ? '✓ configurado' : '✗ falta SURVEYMONKEY_TOKEN'}`);
-  console.log(`Firebase: ${db ? '✓ conectado' : '✗ falta FIREBASE_SERVICE_ACCOUNT'}`);
-  console.log(`Meta Ads: ${META_TOKEN ? '✓ configurado' : '✗ falta META_TOKEN'}`);
+  console.log(`Pulso Sync Server v3 corriendo en puerto ${PORT}`);
+  console.log(`SM Token: ${SM_TOKEN ? '✓' : '✗ falta SURVEYMONKEY_TOKEN'}`);
+  console.log(`Firebase: ${db    ? '✓' : '✗ falta FIREBASE_SERVICE_ACCOUNT'}`);
+  console.log(`Meta Ads: ${META_TOKEN ? '✓' : '✗ falta META_TOKEN'}`);
+  console.log(`Modo default: CSV export (menos requests a SM API)`);
 });
