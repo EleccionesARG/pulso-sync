@@ -535,6 +535,8 @@ function startConfigListener() {
     try {
       const config  = typeof val === 'string' ? JSON.parse(val) : val;
       const surveys = config.activeSurveys || [];
+
+      // Agregar / actualizar encuestas presentes en config
       for (const sv of surveys) {
         const sid = String(sv.smSurveyId);
         if (!sid || !sv.colMap) continue;
@@ -547,6 +549,22 @@ function startConfigListener() {
           syncConfigs[sid] = { surveyId: sid, colMap: sv.colMap, muestraId: sv.muestraId, intervalMinutes: minutes, useCSV: sv.useCSV !== false };
           startCronForSurvey(sid, minutes);
           console.log(`[config] ${existing ? 'Actualizado' : 'Nuevo'}: ${sid} (${sv.smTitle || sid})`);
+        }
+      }
+
+      // Detener y limpiar encuestas que ya no están en activeSurveys
+      const activeSids = new Set(surveys.map(sv => String(sv.smSurveyId)));
+      for (const sid of Object.keys(syncConfigs)) {
+        if (!activeSids.has(sid)) {
+          if (cronJobs[sid]) { cronJobs[sid].stop(); delete cronJobs[sid]; }
+          delete syncConfigs[sid];
+          console.log(`[config] Removido (ya no está en activeSurveys): ${sid}`);
+          // Limpiar nodo de Firebase para no dejar basura que dispare el agente
+          if (db) {
+            db.ref(`pulso/v4sync/${sid}`).remove()
+              .then(() => console.log(`[config] Firebase limpiado: pulso/v4sync/${sid}`))
+              .catch(e => console.warn(`[config] Error limpiando Firebase ${sid}:`, e.message));
+          }
         }
       }
     } catch (e) {
