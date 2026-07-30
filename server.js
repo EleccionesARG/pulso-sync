@@ -451,6 +451,7 @@ async function getAppState() {
   } catch (e) { return {}; }
 }
 
+const lastSyncErrors = {};
 async function runSyncForSurvey(surveyId) {
   const cfg = syncConfigs[surveyId];
   if (!cfg) return;
@@ -458,8 +459,16 @@ async function runSyncForSurvey(surveyId) {
     const appState = await getAppState();
     const muestra  = (appState.muestras || []).find(m => m.id === cfg.muestraId) || null;
     await syncSurvey(surveyId, cfg.colMap, muestra, appState);
+    delete lastSyncErrors[surveyId];
   } catch (e) {
     console.error(`Error en sync [${surveyId}]:`, e.message);
+    const raw = e.response ? e.response.data : undefined;
+    lastSyncErrors[surveyId] = {
+      at: new Date().toISOString(),
+      message: e.message,
+      upstreamStatus: e.response ? e.response.status : null,
+      detail: typeof raw === 'string' ? raw.slice(0, 300) : raw,
+    };
   }
 }
 
@@ -692,6 +701,7 @@ app.get('/sync/status', (req, res) => {
       intervalMinutes: syncConfigs[id].intervalMinutes,
       mode: syncConfigs[id].useCSV === false ? 'API' : 'CSV',
       cronActive: !!cronJobs[id],
+      lastError: lastSyncErrors[id] || null,
     })),
   });
 });
