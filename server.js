@@ -713,8 +713,18 @@ app.post('/sync/stop', (req, res) => {
 // Diagnóstico: IP de salida real + sonda a SurveyMonkey con token INVÁLIDO a propósito.
 // Si la sonda da 401 (JSON de SM) → el firewall nos deja pasar y el problema es de cuenta.
 // Si da 403 (HTML de CloudFront) → el firewall bloquea la IP/rango de Railway.
+const SERVER_STARTED_AT = new Date().toISOString();
 app.get('/debug/egress', async (req, res) => {
   const out = {};
+  // Identidad del deployment según Railway (nombres, no secretos):
+  // permite verificar QUÉ proyecto/servicio/environment está corriendo esta URL.
+  out.runtime = {
+    project: process.env.RAILWAY_PROJECT_NAME || null,
+    environment: process.env.RAILWAY_ENVIRONMENT_NAME || null,
+    service: process.env.RAILWAY_SERVICE_NAME || null,
+    startedAt: SERVER_STARTED_AT,
+    varNames: Object.keys(process.env).filter(k => /TOKEN|SURVEY|FIREBASE|META/i.test(k)).sort(),
+  };
   // Huella del token cargado en memoria (hash + longitud, NUNCA el token):
   // permite comparar contra el token que el usuario cree que está configurado.
   if (SM_TOKEN) {
