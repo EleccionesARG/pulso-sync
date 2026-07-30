@@ -715,6 +715,16 @@ app.post('/sync/stop', (req, res) => {
 // Si da 403 (HTML de CloudFront) → el firewall bloquea la IP/rango de Railway.
 app.get('/debug/egress', async (req, res) => {
   const out = {};
+  // Huella del token cargado en memoria (hash + longitud, NUNCA el token):
+  // permite comparar contra el token que el usuario cree que está configurado.
+  if (SM_TOKEN) {
+    const crypto = require('crypto');
+    out.tokenFingerprint = {
+      length: SM_TOKEN.length,
+      sha256_12: crypto.createHash('sha256').update(SM_TOKEN).digest('hex').slice(0, 12),
+      trimmedDiffers: SM_TOKEN !== SM_TOKEN.trim(),
+    };
+  } else { out.tokenFingerprint = null; }
   try {
     out.egressIp = (await axios.get('https://api.ipify.org?format=json', { timeout: 10000 })).data.ip;
   } catch (e) { out.egressIpError = e.message; }
