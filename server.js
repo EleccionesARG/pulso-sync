@@ -587,7 +587,7 @@ app.get('/', (req, res) => {
   }));
   res.json({
     status: 'ok',
-    service: 'Pulso Sync Server v3.1 (CSV mode + auto-recovery)',
+    service: 'Pulso Sync Server v3.1.1-diag (CSV mode + auto-recovery)',
     firebase: !!db,
     sm_token: !!SM_TOKEN,
     activeSurveys,
@@ -603,7 +603,12 @@ app.get('/surveys', async (req, res) => {
       id: s.id, title: s.title,
       response_count: s.response_count, date_modified: s.date_modified,
     }))});
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    // Diagnóstico: devolver también qué respondió SurveyMonkey/CloudFront (sin token)
+    const raw = e.response ? e.response.data : undefined;
+    const detail = typeof raw === 'string' ? raw.slice(0, 400) : raw;
+    res.status(500).json({ error: e.message, upstreamStatus: e.response ? e.response.status : null, detail });
+  }
 });
 
 app.get('/surveys/:id/questions', async (req, res) => {
@@ -703,6 +708,25 @@ app.post('/sync/stop', (req, res) => {
     Object.keys(syncConfigs).forEach(k => delete syncConfigs[k]);
     res.json({ ok: true, message: 'Todos los syncs detenidos' });
   }
+});
+
+// Diagnóstico: IP de salida real + sonda a SurveyMonkey con token INVÁLIDO a propósito.
+// Si la sonda da 401 (JSON de SM) → el firewall nos deja pasar y el problema es de cuenta.
+// Si da 403 (HTML de CloudFront) → el firewall bloquea la IP/rango de Railway.
+app.get('/debug/egress', async (req, res) => {
+  const out = {};
+  try {
+    out.egressIp = (await axios.get('https://api.ipify.org?format=json', { timeout: 10000 })).data.ip;
+  } catch (e) { out.egressIpError = e.message; }
+  try {
+    const r = await axios.get(`${SM_BASE}/surveys`, {
+      headers: { Authorization: 'Bearer token-invalido-sonda' },
+      timeout: 15000,
+      validateStatus: () => true,
+    });
+    out.smProbe = { status: r.status, body: typeof r.data === 'string' ? r.data.slice(0, 300) : r.data };
+  } catch (e) { out.smProbeError = e.message; }
+  res.json(out);
 });
 
 // Meta Ads proxy (sin cambios)
