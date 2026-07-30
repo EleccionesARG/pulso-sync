@@ -431,9 +431,22 @@ async function syncSurveyAPI(surveyId, colMap, muestra, appState) {
 
 async function syncSurvey(surveyId, colMap, muestra, appState) {
   const cfg = syncConfigs[surveyId] || {};
-  return cfg.useCSV !== false
-    ? syncSurveyCSV(surveyId, colMap, muestra)
-    : syncSurveyAPI(surveyId, colMap, muestra, appState);
+  if (cfg.useCSV !== false) {
+    try {
+      return await syncSurveyCSV(surveyId, colMap, muestra);
+    } catch (e) {
+      // No toda app de SM tiene acceso al endpoint de exports (da 404/403).
+      // En ese caso caemos al modo API estándar (responses/bulk) y lo recordamos.
+      const st = e.response ? e.response.status : null;
+      if (st === 404 || st === 403) {
+        console.warn(`[sync ${surveyId}] export CSV no disponible (HTTP ${st}) → fallback a modo API`);
+        cfg.useCSV = false;
+        return syncSurveyAPI(surveyId, colMap, muestra, appState);
+      }
+      throw e;
+    }
+  }
+  return syncSurveyAPI(surveyId, colMap, muestra, appState);
 }
 
 // ══════════════════════════════════════════
